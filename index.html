@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>销售预测看板（按门店 · 近30天滚动移动平均预测7天）</title>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  :root{
+    --bg:#0b1220;--card:#141b2d;--text:#e6efff;--muted:#8ea1c0;--border:#24324a;--accent:#4da3ff;
+  }
+  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,'PingFang SC','Microsoft YaHei',sans-serif}
+  header{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  header h1{font-size:18px;margin:0}
+  .hint{color:var(--muted);font-size:13px}
+  .wrap{padding:20px;display:grid;grid-template-columns:1fr;gap:16px;max-width:1200px;margin:0 auto}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px}
+  .card h2{font-size:16px;margin:0 0 10px 0}
+  .controls{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+  input[type="number"],select{background:#0e1626;border:1px solid var(--border);color:var(--text);padding:8px 10px;border-radius:10px}
+  input[type="file"]{color:var(--text)}
+  canvas{max-width:100%;height:360px}
+  .note{color:var(--muted);font-size:12px;margin-top:8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>销售预测看板</h1>
+  <div class="hint">上传Excel → 选择门店 → 近30天销售总金额 · 滚动移动平均预测未来7天</div>
+</header>
+
+<div class="wrap">
+  <section class="card">
+    <h2>数据上传与配置</h2>
+    <div class="controls">
+      <input id="fileInput" type="file" accept=".xlsx,.xls" />
+      <label>门店：
+        <select id="storeSel" disabled>
+          <option value="ALL">全部门店</option>
+        </select>
+      </label>
+      <label>移动平均窗口(天)：
+        <input id="win" type="number" min="2" max="30" step="1" value="7" />
+      </label>
+      <button id="recalcBtn" style="background:var(--accent);border:0;padding:8px 12px;border-radius:10px;font-weight:600;cursor:pointer;">重新计算</button>
+    </div>
+    <div class="note">必须包含列名：<b>销售日期、门店名称、销售总额</b>（其余列可选）。日期支持文本日期或Excel序列号。</div>
+  </section>
+
+  <section class="card">
+    <h2 id="title">近30天销售总金额与7天预测</h2>
+    <canvas id="chart"></canvas>
+    <div class="note" id="rangeNote"></div>
+  </section>
+</div>
+
+<script>
+let rawRows = [];          
+let stores = [];           
+let chart = null;
+
+const fileInput = document.getElementById('fileInput');
+const storeSel  = document.getElementById('storeSel');
+const winEl     = document.getElementById('win');
+const recalcBtn = document.getElementById('recalcBtn');
+const titleEl   = document.getElementById('title');
+const rangeNote = document.getElementById('rangeNote');
+
+fileInput.addEventListener('change', handleFile);
+storeSel.addEventListener('change', computeAndRender);
+winEl.addEventListener('input', computeAndRender);
+recalcBtn.addEventListener('click', computeAndRender);
+
+function handleFile(e){
+  const file = e.target.files?.[0];
+  if(!file) return;
+  const fr = new FileReader();
+  fr.onload = ev=>{
+    const wb = XLSX.read(new Uint8Array(ev.target.result), {type:'array'});
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws, {defval:null});
+
+    const need = ['销售日期','门店名称','销售总额'];
+    const cols = Object.keys(rows[0] || {});
+    for(const c of need){
+      if(!cols.includes(c)){
+        alert(`缺少必要列：${c}`);
+        return;
+      }
+    }
+
+    rawRows = rows.map(r=>({
+      date: parseExcelDate(r['销售日期']),
+      store: String(r['门店名称']).trim(),
+      amount: Number(r['销售总额']) || 0
+    })).filter(r=>r.date!=null && r.store);
+
+    if(!rawRows.length){ alert('没有可用数据'); return; }
+
+    stores = Array.from(new Set(rawRows.map(r=>r.store))).sort();
+    storeSel.innerHTML = `<option value="ALL">全部门店</option>` + stores.map(s=>`<option value="${s}">${s}</option>`).join('');
+    storeSel.disabled = false;
+
+    computeAndRender();
+  };
+  fr.readAsArrayBuffer(file);
+}
+
+function parseExcelDate(v){
+  if(v==null || v==='') return null;
+  if(typeof v === 'number'){
+    const epoch = new Date(Date.UTC(1899,11,30));
+    const d = new Date(epoch.getTime() + v*86400000);
+    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  }
+  const t = (''+v).trim().replace(/\//g,'-').replace(/\./g,'-');
+  const d = new Date(t);
+  if(isNaN(d)) return null;
+  return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+}
+
+function fmt(d){ return d ? new Date(d.getTime()-d.getTimezoneOffset()*60000).toISOString().slice(0,10) : ''; }
+
+function computeAndRender(){
+  if(!rawRows.length) return;
+
+  const selStore = storeSel.value || 'ALL';
+  const win = Math.max(2, Math.min(30, parseInt(winEl.value)||7));
+
+  const mapStoreDate = new Map();
+  for(const r of rawRows){
+    const key = `${fmt(r.date)}|${r.store}`;
+    mapStoreDate.set(key, (mapStoreDate.get(key)||0) + r.amount);
+  }
+
+  const mapDaily = new Map();
+  if(selStore === 'ALL'){
+    for(const [key,amt] of mapStoreDate){
+      const [d,_s] = key.split('|');
+      mapDaily.set(d, (mapDaily.get(d)||0) + amt);
+    }
+  }else{
+    for(const [key,amt] of mapStoreDate){
+      const [d,s] = key.split('|');
+      if(s === selStore){
+        mapDaily.set(d, (mapDaily.get(d)||0) + amt);
+      }
+    }
+  }
+
+  const series = Array.from(mapDaily.entries())
+    .map(([date,amount])=>({date,amount}))
+    .sort((a,b)=>a.date.localeCompare(b.date));
+
+  if(series.length === 0){
+    renderChart([], [], [], [], selStore, win);
+    titleEl.textContent = `近30天销售总金额与7天预测（${selStore==='ALL'?'全部门店':selStore}）`;
+    rangeNote.textContent = '所选门店暂无数据。';
+    return;
+  }
+
+  const last30 = series.slice(-30);
+  const histDates  = last30.map(x=>x.date);
+  const histAmount = last30.map(x=>x.amount);
+
+  // ---- 滚动移动平均预测未来7天 ----
+  const rollingSMA = (arr,k) => {
+    if(arr.length<k) return arr.reduce((a,b)=>a+b,0)/arr.length;
+    return arr.slice(-k).reduce((a,b)=>a+b,0)/k;
+  };
+
+  let futureValues = [...histAmount];
+  const fcDates = [];
+  const fcValues = [];
+  const lastDate = new Date(histDates[histDates.length-1]);
+
+  for(let i=1;i<=7;i++){
+    const nextDate = new Date(lastDate);
+    nextDate.setUTCDate(lastDate.getUTCDate()+i);
+    fcDates.push(fmt(nextDate));
+
+    const nextValue = rollingSMA(futureValues, win);
+    fcValues.push(+nextValue.toFixed(2));
+    futureValues.push(nextValue);  // 滚动加入未来预测
+  }
+
+  renderChart(histDates, histAmount, fcDates, fcValues, selStore, win);
+
+  const fullStart = series[0].date, fullEnd = series[series.length-1].date;
+  titleEl.textContent = `近30天销售总金额与7天预测（${selStore==='ALL'?'全部门店':selStore}）`;
+  rangeNote.textContent = `数据范围：${fullStart} ～ ${fullEnd}；已取最近 ${histDates.length} 天作为历史窗口，移动平均窗口 = ${win} 天。`;
+}
+
+function renderChart(histDates, histAmount, fcDates, fcValues, selStore, win){
+  const ctx = document.getElementById('chart').getContext('2d');
+  const labels = [...histDates, ...fcDates];
+  const histData = [...histAmount];
+  const fcData = [...Array(histAmount.length).fill(null), ...fcValues];
+
+  if(chart) chart.destroy();
+  chart = new Chart(ctx, {
+    type:'line',
+    data:{
+      labels,
+      datasets:[
+        {label:'实际销售总金额', data:histData, borderWidth:2, tension:.2, pointRadius:2},
+        {label:`预测销售总金额（滚动SMA${win}）`, data:fcData, borderWidth:2, borderDash:[6,6], tension:.2, pointRadius:0}
+      ]
+    },
+    options:{
+      responsive:true,
+      interaction:{mode:'nearest',intersect:false},
+      scales:{
+        y:{title:{display:true,text:'销售总金额（元）'}},
+        x:{title:{display:true,text:'日期'}}
+      },
+      plugins:{
+        tooltip:{callbacks:{
+          label:(ctx)=>{
+            const v = ctx.parsed.y;
+            return `${ctx.dataset.label}: ${v!=null? v.toLocaleString(undefined,{maximumFractionDigits:2}) : '-'}`;
+          }
+        }},
+        legend:{labels:{color:'#e6efff'}}
+      }
+    }
+  });
+}
+</script>
+</body>
+</html>
